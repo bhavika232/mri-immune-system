@@ -108,11 +108,23 @@ Included **only as a contrast condition.** It is crude and trivially detectable,
 and exists to demonstrate what an obvious attack looks like so the subtle ones
 can be measured against it. We do not claim it as a contribution.
 
-### Shared constraint
+### Shared constraints
 
 Every poisoned mask must remain **binary** and **non-empty** (except `blank`).
 A poisoned mask containing interpolated or fractional values would be detectable
 by a trivial type check and would not represent a realistic annotation error.
+
+**Anatomical containment.** Every poisoned mask must lie entirely within brain
+tissue. The first implementation did not enforce this, and measurement showed
+it was the only geometric signal either attack leaked: an unconstrained shift
+or dilation can push part of the mask into the black background outside the
+skull, which is immediately visible. `shift` now redraws its offset until the
+mask is fully contained (falling back to clipping in the rare cases where no
+offset fits), and dilation is intersected with the brain region.
+
+Adding the constraint cost no attack strength — mean Dice between clean and
+poisoned masks was unchanged — and removed the signal entirely. See
+`docs/plausibility_metric.md` §5.
 
 ## 6. Attack success criteria
 

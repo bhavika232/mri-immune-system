@@ -30,12 +30,16 @@ never be visible to the defender.
 import argparse
 import json
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 from PIL import Image
 from scipy import ndimage
 from tqdm import tqdm
+
+try:                                    # python -m src.poison
+    from src.plausibility import brain_mask
+except ImportError:                     # python src/poison.py
+    from plausibility import brain_mask
 
 MANIFEST = "data/processed/manifest.csv"
 SPLIT_FILE = "splits/split_v1.json"
@@ -55,27 +59,54 @@ def _disk(radius):
     return (yy ** 2 + xx ** 2) <= radius ** 2 * 1.0 + 1e-9 if size else np.ones((1, 1), bool)
 
 
-def shift_mask(mask, rng, min_px=3, max_px=10):
+def shift_mask(mask, rng, brain, min_px=3, max_px=10, max_tries=20):
     """
-    Translate the mask by a small random offset.
+    Translate the mask by a small random offset, kept inside the brain.
 
     Size, shape and smoothness are preserved exactly - only the position moves.
-    Shifted-in regions are filled with background rather than wrapped, so the
-    mask never reappears on the opposite side of the image.
+    Offsets that would push part of the mask into the black background are
+    rejected and redrawn: spilling outside the brain is the one thing that
+    makes a shifted mask visibly fake, so the attack must avoid it.
     """
-    magnitude = rng.integers(min_px, max_px + 1)
-    angle = rng.uniform(0, 2 * np.pi)
-    dy = int(round(magnitude * np.sin(angle)))
-    dx = int(round(magnitude * np.cos(angle)))
+    binary = mask.astype(bool)
+    outside = ~brain.astype(bool)
+    best = best_params = None
+    best_spill = None
 
-    out = ndimage.shift(mask.astype(np.float32), shift=(dy, dx),
-                        order=0, mode="constant", cval=0.0)
-    return (out > 0.5).astype(np.uint8), {"dy": dy, "dx": dx, "magnitude": int(magnitude)}
+    for _ in range(max_tries):
+        magnitude = int(rng.integers(min_px, max_px + 1))
+        angle = rng.uniform(0, 2 * np.pi)
+        dy = int(round(magnitude * np.sin(angle)))
+        dx = int(round(magnitude * np.cos(angle)))
 
+        shifted = ndimage.shift(binary.astype(np.float32), shift=(dy, dx),
+                                order=0, mode="constant", cval=0.0) > 0.5
+        spill = int((shifted & outside).sum())
+        params = {"dy": dy, "dx": dx, "magnitude": magnitude,
+                  "tries": _ + 1, "clipped": False}
 
-def grow_shrink_mask(mask, rng, min_r=2, max_r=6):
+        if spill == 0:                       # fully inside the brain, done
+            return shifted.astype(np.uint8), params
+        if best_spill is None or spill < best_spill:
+            best, best_params, best_spill = shifted, params, spill
+
+    # No fully-contained offset exists - usually a tumour nearly filling a
+    # small brain cross-section. Clip the least-bad attempt to the brain.
+    # This no longer preserves shape exactly, so it is recorded.
+    clipped = best & brain.astype(bool)
+    if not clipped.any():                    # clipping removed everything
+        return mask.astype(np.uint8), {"dy": 0, "dx": 0, "magnitude": 0,
+                                       "tries": max_tries, "clipped": True,
+                                       "failed": True}
+    best_params["clipped"] = True
+    return clipped.astype(np.uint8), best_params
+
+def grow_shrink_mask(mask, rng, brain, min_r=2, max_r=6):
     """
     Dilate or erode the mask by a morphological radius.
+
+    Dilation is clipped to the brain, so a grown mask never bleeds into the
+    black background. Erosion only shrinks and so can never leave the brain.
 
     Erosion that would empty the mask is retried at smaller radii and finally
     falls back to dilation: an empty mask is a different (obvious) attack, and
@@ -84,9 +115,10 @@ def grow_shrink_mask(mask, rng, min_r=2, max_r=6):
     radius = int(rng.integers(min_r, max_r + 1))
     grow = bool(rng.integers(0, 2))
     binary = mask.astype(bool)
+    inside = brain.astype(bool)
 
     if grow:
-        out = ndimage.binary_dilation(binary, structure=_disk(radius))
+        out = ndimage.binary_dilation(binary, structure=_disk(radius)) & inside
     else:
         out = ndimage.binary_erosion(binary, structure=_disk(radius))
         while not out.any() and radius > 1:          # too aggressive, back off
@@ -94,13 +126,17 @@ def grow_shrink_mask(mask, rng, min_r=2, max_r=6):
             out = ndimage.binary_erosion(binary, structure=_disk(radius))
         if not out.any():                            # tiny lesion, grow instead
             grow, radius = True, min_r
-            out = ndimage.binary_dilation(binary, structure=_disk(radius))
+            out = ndimage.binary_dilation(binary, structure=_disk(radius)) & inside
 
     return out.astype(np.uint8), {"radius": radius, "op": "dilate" if grow else "erode"}
 
+def blank_mask(mask, rng, brain):
+    """
+    Control condition only. Crude and trivially detectable - see §5.3.
 
-def blank_mask(mask, rng):
-    """Control condition only. Crude and trivially detectable - see §5.3."""
+    Takes `brain` to match the other corruptions' signature (they are all
+    called through the CORRUPTIONS dict) but has no use for it.
+    """
     return np.zeros_like(mask, dtype=np.uint8), {}
 
 
@@ -166,7 +202,12 @@ def poison_dataset(method, rate, seed, root=".", manifest=MANIFEST,
             original = original[..., 0]
         original = (original > 127).astype(np.uint8)
 
-        corrupted, params = corrupt(original, rng)
+        # The brain region lives in the IMAGE, not the mask: a mask only says
+        # "tumour / not tumour" and has no idea what is underneath it.
+        image = np.array(Image.open(root / record["image_path"]), dtype=np.float32)
+        brain = brain_mask(image)
+
+        corrupted, params = corrupt(original, rng, brain)
 
         new_path = mask_dir / f"{record['sample_id']}.png"
         Image.fromarray(corrupted * 255).save(new_path)

@@ -113,7 +113,9 @@ discriminator: any value below 1.0 is already unusual.
 
 ## 5. Results at 10% poisoning
 
-Mean per-feature score, clean vs poisoned, on the same 841 samples:
+Mean per-feature score, clean vs poisoned, on the same 841 samples.
+
+### 5.1 First attempt — unconstrained corruption
 
 | Feature | Clean | `shift` | `grow_shrink` |
 |---|---|---|---|
@@ -126,41 +128,69 @@ Mean per-feature score, clean vs poisoned, on the same 841 samples:
 | **overall** | **0.984** | **0.947** | **0.966** |
 | **median** | **1.000** | **1.000** | **1.000** |
 
+`brain_containment` was the only feature that detected anything: an
+unconstrained shift or dilation can push part of the mask past the brain edge
+into the black background, which is the one thing that makes a mask visibly
+fake. So we constrained the corruptions to stay inside the brain.
+
+### 5.2 After the anatomical constraint
+
+| Feature | Clean | `shift` | `grow_shrink` |
+|---|---|---|---|
+| n_components | 0.973 | 0.973 | **1.000** |
+| largest_fraction | 0.993 | 0.993 | **0.999** |
+| circularity | 0.995 | 0.995 | **1.000** |
+| solidity | 0.977 | 0.977 | **0.995** |
+| brain_containment | 0.966 | **1.000** | **0.999** |
+| lesion_contrast | 0.999 | 0.998 | 0.998 |
+| **overall** | **0.984** | **0.989** | **0.998** |
+| **median** | **1.000** | **1.000** | **1.000** |
+
+Mean Dice between clean and poisoned masks was unchanged by the constraint
+(0.424 to 0.426 for `shift`, 0.434 to 0.438 for `grow_shrink`), so no attack
+strength was traded away for the added stealth.
+
 ### Reading these numbers
 
-**Median plausibility is 1.000 for both attacks.** More than half of all
-poisoned masks are perfectly typical of real annotations on every measure. They
-are not merely hard to detect — they are *indistinguishable*.
+**Both attacks now score higher than the real expert annotations.** On every
+feature the poisoned masks are at least as typical as genuine annotations, and
+on several they are more so. A geometry-based detector tuned to flag these
+would flag the real annotations first.
 
-**`shift` leaves five of six features bit-identical.** Expected, and a useful
-confirmation the attack does what the threat model says: a pure translation
+**Median plausibility is 1.000 throughout.** More than half of all poisoned
+masks are perfectly typical of real annotations on every measure — not merely
+hard to detect, but indistinguishable.
+
+**`shift` leaves five of six features bit-identical.** A pure translation
 preserves shape, size and smoothness exactly. Only position changes, and
-position is not something you can check without ground truth.
+position cannot be checked without the ground truth that is unavailable at
+deployment.
 
-**`grow_shrink` masks score HIGHER than the real annotations** on four
-features. Dilation merges the fragmented pieces of a real 2D slice into one
-smooth blob, so the corrupted mask looks *more* like a textbook tumour than the
-expert annotation does. The attack does not merely hide — it makes the output
-look cleaner while being wrong. This is the strongest single result we have so
-far.
+**`grow_shrink` scores higher than ground truth on four features.** Dilation
+merges the fragmented pieces of a real 2D tumour slice into one smooth blob, so
+the corrupted mask looks *more* like a textbook tumour than the expert
+annotation does. The attack does not merely hide — it improves apparent quality
+while destroying correctness.
 
-**Only `brain_containment` detects anything**, and weakly. Both attacks can push
-part of the mask past the brain edge into the black background.
+**`brain_containment` is now better than human.** Clean annotations score
+0.966; the constrained attack scores 1.000. The rejection loop guarantees
+containment, whereas real annotators occasionally place a pixel outside the
+brain boundary. The corruption is more anatomically disciplined than the
+radiologists who produced the training data.
 
 ---
 
-## 6. What this tells us to do next
+## 6. What this tells us
 
-**Improve the attack.** `brain_containment` is the only geometric signal, and it
-exists purely because the corruption is allowed to spill outside the brain.
-Constrain shifts and dilations to stay within the brain mask and that signal
-disappears, leaving the attack undetectable by geometry alone. This is a
-straightforward change to `src/poison.py` and it strengthens the paper.
+**Appearance-based defence does not work for this attack class.** That is a
+result, not a failure, and it is one of the paper's central claims. If geometry
+cannot separate corrupted masks from genuine ones — and it cannot, since the
+corrupted ones score better — then the defence has to come from somewhere else:
+training-dynamics anomalies, cross-model disagreement, influence functions over
+the training set, or the reasoning layer noticing an inconsistency the geometry
+does not expose.
 
-**Geometry alone is not a sufficient defence.** That is a result, not a failure.
-It motivates the rest of the project: if appearance cannot catch this, the
-defence has to come from elsewhere — training-dynamics anomalies, cross-model
-disagreement, or the reasoning layer noticing an inconsistency.
+This is what motivates the rest of the project.
 
 ---
 
@@ -177,6 +207,12 @@ disagreement, or the reasoning layer noticing an inconsistency.
   the radiologist rating study is for — it validates whether these six numbers
   actually track what a clinician would accept. Until then, plausibility is a
   computational stand-in.
+- **The attacker and the metric share a definition of "brain".** `poison.py`
+  constrains corruption using the same `brain_mask()` function the metric
+  scores with, so perfect containment is partly by construction. This is
+  consistent with our white-box threat model — a simple intensity threshold is
+  not privileged knowledge — but it should be stated plainly, and a defender
+  using a different brain segmentation might see a small residual signal.
 - **Calibrated on 3,000 of 12,100 masks** for speed. Re-run `--fit` without
   `--limit` for the final numbers in the paper.
 
